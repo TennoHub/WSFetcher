@@ -1,0 +1,97 @@
+name: Update Warframe WorldState
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force update even if no changes"
+        required: false
+        default: "false"
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+      - name: Start WARP service
+        run: |
+          sudo systemctl enable warp-svc --now || true
+          sudo systemctl start warp-svc || true
+          sleep 3
+
+      - name: Register and connect WARP
+        run: |
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode warp+doh
+          warp-cli --accept-tos connect
+
+      - name: Verify WARP is on
+        run: |
+          for i in {1..20}; do
+            OUT="$(curl -fsS https://www.cloudflare.com/cdn-cgi/trace || true)"
+            echo "$OUT"
+            echo "$OUT" | grep -q "warp=on" && exit 0
+            sleep 2
+          done
+          echo "WARP did not come up"
+          exit 1
+
+      - name: Fetch worldState and save ws.json
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          import urllib.request
+
+          url = "https://api.warframe.com/cdn/worldState.php"
+
+          try:
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  raw = r.read().decode("utf-8")
+              data = json.loads(raw)  # validate first
+
+              with open("ws.json", "w", encoding="utf-8") as f:
+                  json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+
+              print("ws.json updated")
+          except Exception as e:
+              print(f"Fetch failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ws.json
+
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            git commit -m "Force update ws.json" || echo "Nothing to commit"
+          else
+            git diff --cached --quiet && exit 0
+            git commit -m "Update ws.json"
+          fi
+
+          git push
